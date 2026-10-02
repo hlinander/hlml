@@ -265,6 +265,7 @@ def export_periodic_filesystem(
     import threading
     import time
     import lib.render_duck as duck
+    from lib.export import EXPORT_LOCK
     from lib.log import log_next_in
 
     def export_loop():
@@ -277,21 +278,34 @@ def export_periodic_filesystem(
         cursor = duck.CONN.cursor()
 
         while True:
-            try:
-                paths = flush_all_to_filesystem(train_run, staging_dir, cursor)
-                if paths:
-                    log_next_in("export", f"Exported {len(paths)} files to filesystem", interval_seconds)
-            except Exception as e:
-                import traceback
-                log("export", f"Error during export: {e}\n{traceback.format_exc()}")
+            with EXPORT_LOCK:
+                try:
+                    paths = flush_all_to_filesystem(train_run, staging_dir, cursor)
+                    if paths:
+                        log_next_in(
+                            "export",
+                            f"Exported {len(paths)} files to filesystem",
+                            interval_seconds,
+                        )
+                except Exception as e:
+                    import traceback
 
-            try:
-                from lib.paths import get_or_create_checkpoint_path
-                checkpoint_path = get_or_create_checkpoint_path(train_run.train_config)
-                flush_all_to_checkpoint(train_run, checkpoint_path, cursor)
-            except Exception as e:
-                import traceback
-                log("export", f"Error during checkpoint export: {e}\n{traceback.format_exc()}")
+                    log("export", f"Error during export: {e}\n{traceback.format_exc()}")
+
+                try:
+                    from lib.paths import get_or_create_checkpoint_path
+
+                    checkpoint_path = get_or_create_checkpoint_path(
+                        train_run.train_config
+                    )
+                    flush_all_to_checkpoint(train_run, checkpoint_path, cursor)
+                except Exception as e:
+                    import traceback
+
+                    log(
+                        "export",
+                        f"Error during checkpoint export: {e}\n{traceback.format_exc()}",
+                    )
 
             time.sleep(interval_seconds)
 

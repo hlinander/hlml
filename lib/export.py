@@ -3,12 +3,15 @@ Unified export module using AnalyticsConfig.
 
 Dispatches to either S3 or filesystem staging based on configuration.
 """
-
+import threading
 from typing import Optional
 from lib.train_dataclasses import TrainRun
 from lib.analytics_config import analytics_config, AnalyticsConfig
 from lib.log import log
 import lib.render_duck as duck
+
+
+EXPORT_LOCK = threading.Lock()
 
 
 def export_all(train_run: TrainRun, config: Optional[AnalyticsConfig] = None) -> list:
@@ -22,6 +25,13 @@ def export_all(train_run: TrainRun, config: Optional[AnalyticsConfig] = None) ->
     Returns:
         List of paths (S3 or filesystem) that were created
     """
+    with EXPORT_LOCK:
+        return _export_all_unlocked(train_run, config)
+
+
+def _export_all_unlocked(
+    train_run: TrainRun, config: Optional[AnalyticsConfig] = None
+) -> list:
     if config is None:
         config = analytics_config()
 
@@ -59,6 +69,11 @@ def export_all(train_run: TrainRun, config: Optional[AnalyticsConfig] = None) ->
 
     elif config.is_feed():
         from lib.export_feed import finish_feed_export
+        from lib.export_feed import _flush_checkpoint_analytics
+
+        # Preserve the source before initialization, admission or HTTP can fail.
+        with duck.CONN_LOCK:
+            _flush_checkpoint_analytics(train_run, cursor)
 
         reference = finish_feed_export(
             train_run=train_run,

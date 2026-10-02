@@ -16,6 +16,7 @@ dependencies = [
     "dill>=0.3.9",
     "duckdb==1.5.2",
     "einops>=0.8.1",
+    "feed-python",
     "filelock>=3.17.0",
     "gitpython>=3.1.44",
     "healpix>=2024.2",
@@ -59,12 +60,10 @@ graphcast = [
 test = [
     "moto[server]>=5.0.0",
 ]
-feed = [
-    "feed-python",
-]
+feed = []  # Compatibility with existing uv --extra feed commands.
 
 [tool.uv.sources]
-feed-python = { git = "https://github.com/linstromcloud/feed-python.git" }
+feed-python = { git = "https://github.com/linstromcloud/feed-python.git", rev = "a809278ab1ea298598a282db49ba605d18552f1d" }
 
 [[tool.uv.index]]
 name = "pyg-wheels"
