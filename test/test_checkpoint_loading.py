@@ -199,6 +199,35 @@ def test_load_checkpoint_train_run_json(checkpoint_env):
     assert train_config["__data__"]["model_config"]["__class__"] == "DenseConfig"
 
 
+def test_checkpoint_readers_accept_an_explicit_root(checkpoint_env):
+    train_run = make_train_run(d_hidden=50)
+    state = _train_and_serialize(train_run)
+    checkpoint_hash = stable_hash_str(train_run.train_config)
+    checkpoint_root = checkpoint_env / "checkpoints"
+    checkpoint_path = checkpoint_root / f"checkpoint_{checkpoint_hash}"
+    torch.save(state.model.state_dict(), checkpoint_path / "model_epoch_0001")
+
+    loaded = load_model_from_checkpoint(
+        checkpoint_hash,
+        "cpu",
+        epoch=1,
+        checkpoint_root=checkpoint_root,
+    )
+    assert loaded is not None
+    assert loaded.epoch == 1
+    assert type(
+        load_checkpoint_data_config(
+            checkpoint_hash, checkpoint_root=checkpoint_root
+        )
+    ).__name__ == "DataSineConfig"
+    assert load_checkpoint_train_run_json(
+        checkpoint_hash, checkpoint_root=checkpoint_root
+    )["__class__"] == "TrainRun"
+    assert list_checkpoint_epochs(
+        checkpoint_hash, checkpoint_root=checkpoint_root
+    ) == [1]
+
+
 def test_list_checkpoint_epochs(checkpoint_env):
     """list_checkpoint_epochs finds epoch-specific checkpoint files."""
     train_run = make_train_run(d_hidden=50)
@@ -439,6 +468,30 @@ def test_resume_optimizer_state_match(checkpoint_env):
                 assert orig == rest, f"Optimizer state mismatch: param {k}, key {sk}: {orig} vs {rest}"
 
 
+def test_resume_preserves_ensemble_dataloader_seed(checkpoint_env, monkeypatch):
+    import lib.serialization as serialization
+
+    train_run = _make_grokking_train_run()
+    train_run.train_config.ensemble_id = 3
+    state = create_initial_state(train_run, None, "cpu")
+    serialize(SerializeConfig(train_run=train_run, train_epoch_state=state))
+
+    observed_seeds = []
+    original = serialization.make_dataloader
+
+    def record_seed(ds, run, device_id, shuffle, seed):
+        observed_seeds.append(seed)
+        return original(ds, run, device_id, shuffle, seed)
+
+    monkeypatch.setattr(serialization, "make_dataloader", record_seed)
+    restored = serialization.deserialize(
+        DeserializeConfig(train_run=train_run, device_id="cpu")
+    )
+
+    assert restored is not None
+    assert observed_seeds == [3, 3]
+
+
 def test_resume_produces_identical_next_step(checkpoint_env):
     """The first training step after resume produces the same loss as continuous training."""
     from lib.serialization import deserialize
@@ -561,5 +614,3 @@ def test_ingest_parquets_no_duplicate_export(checkpoint_env):
         f"SELECT COUNT(*) FROM read_parquet('{analytics_dir}/train_step_metric/*.parquet')"
     ).fetchone()[0]
     assert total_rows == 8, f"Expected 5 + 3 = 8 total rows, got {total_rows}"
-
-

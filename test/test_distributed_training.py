@@ -2,27 +2,94 @@
 Test distributed training request/lock system with concurrent workers.
 """
 import sys
-import os
 import threading
 import time
 import pytest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
 
 from lib.train_distributed import (
     request_train_run,
     fetch_requested_train_run,
     report_done,
-    DISTRIBUTED_TRAINING_REQUEST_PATH,
-    get_distributed_training_request_path,
     get_request_path_from_hash,
 )
-from lib.train import load_or_create_state, do_training
+from lib.train import (
+    _validate_required_resume_state,
+    do_training,
+    load_or_create_state,
+)
 from lib.stable_hash import stable_hash_str
 import lib.render_duck as duck
 
 sys.path.insert(0, str(Path(__file__).parent))
 from conftest import create_train_run
+
+
+def test_required_checkpoint_resume_never_falls_back_to_fresh_state(
+    tmp_path, monkeypatch
+):
+    train_run = create_train_run()
+    train_run.notes = {
+        "require_checkpoint_resume": True,
+        "minimum_resume_epoch": 1,
+    }
+    monkeypatch.setattr("lib.train.prepare_results", lambda *_args: tmp_path)
+    monkeypatch.setattr("lib.train.deserialize", lambda _config: None)
+
+    def unexpected_fresh_state(*_args, **_kwargs):
+        raise AssertionError("strict continuation attempted fresh training")
+
+    monkeypatch.setattr("lib.train.create_initial_state", unexpected_fresh_state)
+
+    with pytest.raises(RuntimeError, match="required checkpoint resume"):
+        load_or_create_state(train_run, "cpu")
+
+
+def test_required_checkpoint_resume_reconciles_optimizer_and_batch_counters():
+    train_run = create_train_run()
+    train_run.notes = {
+        "require_checkpoint_resume": True,
+        "minimum_resume_epoch": 1,
+        "optimizer_updates_per_epoch": 2,
+        "serialized_batch_increments_per_epoch": 4,
+    }
+    state = SimpleNamespace(
+        epoch=1,
+        batch=4,
+        optimizer=SimpleNamespace(state={0: {"step": 2}, 1: {"step": 2}}),
+    )
+
+    _validate_required_resume_state(train_run, state, 1)
+    state.batch = 3
+    with pytest.raises(RuntimeError, match="batch counter"):
+        _validate_required_resume_state(train_run, state, 1)
+
+
+def test_segment_resume_preserves_inherited_counters():
+    notes = dict(optimizer_updates_per_epoch=503,
+                 serialized_batch_increments_per_epoch=1006,
+                 resume_accounting_base_epoch=500,
+                 resume_accounting_base_optimizer_step=251500,
+                 resume_accounting_base_serialized_step=251500)
+    run = SimpleNamespace(notes=notes)
+    state = SimpleNamespace(epoch=600, batch=352100,
+                            optimizer=SimpleNamespace(state={0: {'step': 301800}}))
+    _validate_required_resume_state(run, state, 500)
+    state.batch += 1
+    with pytest.raises(RuntimeError, match='batch counter'):
+        _validate_required_resume_state(run, state, 500)
+
+
+@pytest.mark.parametrize('base', [-1, 601])
+def test_segment_resume_rejects_invalid_base(base):
+    run = SimpleNamespace(notes=dict(optimizer_updates_per_epoch=1,
+                          serialized_batch_increments_per_epoch=1,
+                          resume_accounting_base_epoch=base))
+    state = SimpleNamespace(epoch=600, batch=600,
+                            optimizer=SimpleNamespace(state={0: {'step': 600}}))
+    with pytest.raises(RuntimeError, match='accounting base'):
+        _validate_required_resume_state(run, state, 0)
 
 
 @pytest.fixture

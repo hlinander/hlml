@@ -162,13 +162,27 @@ class TrainEval:
 
 
 def get_num_gpus():
+    try:
+        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        if world_size > 1:
+            return world_size
+    except ValueError:
+        pass
+
     cuda_devices = os.getenv("CUDA_VISIBLE_DEVICES", None)
     if cuda_devices is not None:
-        return len(cuda_devices.split(","))
+        return len([device for device in cuda_devices.split(",") if device.strip()])
     return 0
 
 
 def is_distributed():
+    try:
+        if "WORLD_SIZE" in os.environ:
+            return int(os.environ["WORLD_SIZE"]) > 1
+    except ValueError:
+        return False
+    # A single orchestration process sees all allocated GPUs, then launches
+    # the per-rank torchrun workers in lib.distributed_trainer.
     return get_num_gpus() > 1
 
 
@@ -191,6 +205,7 @@ class ComputeConfig:
     num_workers: int = field(default_factory=get_num_workers)
     distributed: bool = field(default_factory=is_distributed)
     num_gpus: int = field(default_factory=get_num_gpus)
+    find_unused_parameters: bool = True
 
     def serialize_human(self):
         return self.__dict__

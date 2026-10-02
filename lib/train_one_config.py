@@ -1,5 +1,6 @@
 import os
 import sys
+import torch
 
 from lib.ddp import ddp_setup
 from lib.train import load_or_create_state
@@ -21,4 +22,8 @@ if __name__ == "__main__":
         print("This should only be called from a locked context.")
         exit(1)
     device = ddp_setup()
-    do_train_run(sys.argv[1], device)
+    try:
+        do_train_run(sys.argv[1], device)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

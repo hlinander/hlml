@@ -22,7 +22,7 @@ from lib.compute_env import env as compute_env
 class RunConfig:
     """Configuration for a run mode"""
 
-    device: str
+    device: str | None
     runner: list[str]  # Command prefix
     env_vars: dict[str, str]
 
@@ -31,9 +31,14 @@ def get_mode_config(mode: str, nproc: int) -> RunConfig:
     """Get configuration for each mode"""
     configs = {
         "torchrun": RunConfig(
-            device="cuda",
+            # Let each torchrun worker select its device from LOCAL_RANK in
+            # ddp_setup(). Setting TORCH_DEVICE here bypasses process-group
+            # initialization and sends every worker to the same device.
+            device=None,
             runner=[
-                "torchrun",
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
                 "--nnodes=1",
                 f"--nproc_per_node={nproc}",
                 "--rdzv_backend=c10d",
@@ -63,6 +68,22 @@ def get_mode_config(mode: str, nproc: int) -> RunConfig:
         ),
     }
     return configs[mode]
+
+
+def infer_torchrun_processes() -> int:
+    """Infer the local worker count from the GPUs visible to this process."""
+    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None:
+        devices = [device for device in visible_devices.split(",") if device.strip()]
+        if devices:
+            return len(devices)
+
+    try:
+        import torch
+
+        return max(torch.cuda.device_count(), 1)
+    except ImportError:
+        return 1
 
 
 def detect_default_mode() -> str:
@@ -95,8 +116,8 @@ def main():
         "--nproc",
         "-n",
         type=int,
-        default=1,
-        help="Number of processes for torchrun (default: 1)",
+        default=None,
+        help="Number of processes for torchrun (default: number of visible GPUs)",
     )
     parser.add_argument(
         "script",
@@ -107,7 +128,10 @@ def main():
 
     # Resolve auto mode
     mode = args.mode if args.mode != "auto" else detect_default_mode()
-    config = get_mode_config(mode, args.nproc)
+    nproc = args.nproc
+    if nproc is None:
+        nproc = infer_torchrun_processes() if mode == "torchrun" else 1
+    config = get_mode_config(mode, nproc)
 
     # Set file descriptor limit
     try:
@@ -118,7 +142,10 @@ def main():
 
     # Build environment
     env = os.environ.copy()
-    env["TORCH_DEVICE"] = config.device
+    if config.device is None:
+        env.pop("TORCH_DEVICE", None)
+    else:
+        env["TORCH_DEVICE"] = config.device
     env["PYTHONBREAKPOINT"] = "ipdb.set_trace"
     env["PYTHONUNBUFFERED"] = "1"
     env.update(config.env_vars)
