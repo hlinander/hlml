@@ -174,9 +174,14 @@ def create_model(config: DeserializeConfig, state_dict: torch.Tensor):
     model = model.to(device=torch.device(config.device_id))
 
     if config.train_run.compute_config.distributed:
-        device_id_list = [config.device_id]
+        device = torch.device(config.device_id)
+        ddp_kwargs = {"device_ids": [config.device_id]} if device.type == "cuda" else {}
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=device_id_list, find_unused_parameters=True
+            model,
+            find_unused_parameters=getattr(
+                config.train_run.compute_config, "find_unused_parameters", True
+            ),
+            **ddp_kwargs,
         )
         model.module.load_state_dict(state_dict)
     else:
@@ -304,12 +309,20 @@ def deserialize(config: DeserializeConfig):
 
     train_ds = data_factory.get_factory().create(train_config.train_data_config)
     train_dataloader = make_dataloader(
-        train_ds, config.train_run, config.device_id, shuffle=True, seed=0,
+        train_ds,
+        config.train_run,
+        config.device_id,
+        shuffle=True,
+        seed=train_config.ensemble_id,
     )
     if train_config.val_data_config is not None:
         val_ds = data_factory.get_factory().create(train_config.val_data_config)
         val_dataloader = make_dataloader(
-            val_ds, config.train_run, config.device_id, shuffle=False, seed=0,
+            val_ds,
+            config.train_run,
+            config.device_id,
+            shuffle=False,
+            seed=train_config.ensemble_id,
         )
     else:
         val_dataloader = None
@@ -420,7 +433,22 @@ def _deserialize_dataclass(json_dict, class_registry):
     return cls(**data)
 
 
-def load_model_from_checkpoint(checkpoint_hash_hex, device_id, epoch=None):
+def _read_checkpoint_path(checkpoint_hash_hex, checkpoint_root=None):
+    root = (
+        env().paths.checkpoints
+        if checkpoint_root is None
+        else Path(checkpoint_root)
+    )
+    return root / f"checkpoint_{checkpoint_hash_hex}"
+
+
+def load_model_from_checkpoint(
+    checkpoint_hash_hex,
+    device_id,
+    epoch=None,
+    *,
+    checkpoint_root=None,
+):
     """Load a model from a checkpoint using the config saved in train_run.json.
 
     This allows loading checkpoints whose TrainConfig no longer exists in code,
@@ -433,12 +461,15 @@ def load_model_from_checkpoint(checkpoint_hash_hex, device_id, epoch=None):
         device_id: The torch device to load the model onto.
         epoch: If provided, load the epoch-specific checkpoint
             (model_epoch_XXXX) instead of the latest model.
+        checkpoint_root: Optional directory containing ``checkpoint_*``
+            directories. The configured checkpoint root remains the default.
 
     Returns:
         A DeserializedModel, or None if the checkpoint doesn't exist.
     """
-    checkpoint_dir = env().paths.checkpoints
-    checkpoint_path = checkpoint_dir / f"checkpoint_{checkpoint_hash_hex}"
+    checkpoint_path = _read_checkpoint_path(
+        checkpoint_hash_hex, checkpoint_root
+    )
     json_path = checkpoint_path / "train_run.json"
     if not json_path.is_file():
         print(f"No train_run.json found at {checkpoint_path}")
@@ -485,17 +516,19 @@ def load_model_from_checkpoint(checkpoint_hash_hex, device_id, epoch=None):
     return DeserializedModel(model=model, epoch=loaded_epoch, model_id=model_id)
 
 
-def load_checkpoint_train_run_json(checkpoint_hash_hex):
+def load_checkpoint_train_run_json(checkpoint_hash_hex, *, checkpoint_root=None):
     """Load the raw train_run.json dict from a checkpoint."""
-    checkpoint_dir = env().paths.checkpoints
-    checkpoint_path = checkpoint_dir / f"checkpoint_{checkpoint_hash_hex}"
+    checkpoint_path = _read_checkpoint_path(
+        checkpoint_hash_hex, checkpoint_root
+    )
     return json.loads((checkpoint_path / "train_run.json").read_text())
 
 
-def load_checkpoint_data_config(checkpoint_hash_hex):
+def load_checkpoint_data_config(checkpoint_hash_hex, *, checkpoint_root=None):
     """Load the train data config from a checkpoint's saved train_run.json."""
-    checkpoint_dir = env().paths.checkpoints
-    checkpoint_path = checkpoint_dir / f"checkpoint_{checkpoint_hash_hex}"
+    checkpoint_path = _read_checkpoint_path(
+        checkpoint_hash_hex, checkpoint_root
+    )
     json_path = checkpoint_path / "train_run.json"
     saved = json.loads(json_path.read_text())
     train_config_data = saved["__data__"]["train_config"]["__data__"]
@@ -505,13 +538,14 @@ def load_checkpoint_data_config(checkpoint_hash_hex):
     )
 
 
-def list_checkpoint_epochs(checkpoint_hash_hex):
+def list_checkpoint_epochs(checkpoint_hash_hex, *, checkpoint_root=None):
     """List available epoch checkpoints for a given checkpoint hash.
 
     Returns a sorted list of epoch numbers that have saved model files.
     """
-    checkpoint_dir = env().paths.checkpoints
-    checkpoint_path = checkpoint_dir / f"checkpoint_{checkpoint_hash_hex}"
+    checkpoint_path = _read_checkpoint_path(
+        checkpoint_hash_hex, checkpoint_root
+    )
     epochs = []
     for p in checkpoint_path.glob("model_epoch_*"):
         try:

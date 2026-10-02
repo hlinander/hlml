@@ -1,4 +1,3 @@
-import os
 import sys
 import traceback
 from pathlib import Path
@@ -8,11 +7,11 @@ import time
 from typing import Dict
 from typing import Optional
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from lib.metric import MetricSample, Metric
 from lib.timing_metric import Timing
 import lib.data_factory as data_factory
-from lib.data_utils import get_sampler, GPUResidentDataLoader, make_dataloader
+from lib.data_utils import get_sampler, make_dataloader
 import lib.model_factory as model_factory
 import lib.render_duck as duck
 
@@ -24,6 +23,7 @@ from lib.train_dataclasses import ComputeConfig
 from lib.serialization import SerializeConfig
 from lib.serialization import DeserializeConfig
 from lib.serialization import deserialize
+from lib.serialization import get_serialized_epoch
 from lib.serialization import serialize
 
 from lib.train_visualization import visualize_progress_batches, visualize_progress
@@ -503,9 +503,14 @@ def create_initial_state(train_run: TrainRun, code_path: Optional[Path], device_
 
     init_model = init_model.to(device=torch.device(device_id))
     if train_run.compute_config.distributed:
-        device_id_list = [device_id]
+        device = torch.device(device_id)
+        ddp_kwargs = {"device_ids": [device_id]} if device.type == "cuda" else {}
         init_model = torch.nn.parallel.DistributedDataParallel(
-            init_model, device_ids=device_id_list, find_unused_parameters=True
+            init_model,
+            find_unused_parameters=getattr(
+                train_run.compute_config, "find_unused_parameters", True
+            ),
+            **ddp_kwargs,
         )
 
     # Re-import classes fresh to avoid dill deserialization breaking
@@ -554,6 +559,47 @@ def create_initial_state(train_run: TrainRun, code_path: Optional[Path], device_
     )
 
 
+def _validate_required_resume_state(
+    train_run: TrainRun,
+    state: TrainEpochState,
+    minimum_resume_epoch: int | None,
+) -> None:
+    notes = train_run.notes
+    if minimum_resume_epoch is not None and int(state.epoch) < minimum_resume_epoch:
+        raise RuntimeError(
+            f"checkpoint epoch {state.epoch} is below required resume "
+            f"epoch {minimum_resume_epoch}"
+        )
+    updates_per_epoch = int(notes["optimizer_updates_per_epoch"])
+    batch_increments_per_epoch = int(notes["serialized_batch_increments_per_epoch"])
+    if updates_per_epoch <= 0 or batch_increments_per_epoch <= 0:
+        raise RuntimeError("strict checkpoint-resume accounting is invalid")
+    # A continuation may change world size while preserving the global batch.
+    base_epoch = int(notes.get("resume_accounting_base_epoch", 0))
+    base_optimizer = int(notes.get("resume_accounting_base_optimizer_step", 0))
+    base_batch = int(notes.get("resume_accounting_base_serialized_step", 0))
+    if min(base_epoch, base_optimizer, base_batch) < 0 or int(state.epoch) < base_epoch:
+        raise RuntimeError("invalid strict checkpoint-resume accounting base")
+    elapsed_epochs = int(state.epoch) - base_epoch
+    expected_optimizer_step = base_optimizer + elapsed_epochs * updates_per_epoch
+    optimizer_steps = set()
+    for parameter_state in state.optimizer.state.values():
+        step = parameter_state.get("step")
+        if step is None:
+            raise RuntimeError("strict checkpoint-resume optimizer lacks a step")
+        optimizer_steps.add(int(step.item() if hasattr(step, "item") else step))
+    if optimizer_steps != {expected_optimizer_step}:
+        raise RuntimeError(
+            f"checkpoint optimizer steps are {sorted(optimizer_steps)}, expected "
+            f"{expected_optimizer_step}"
+        )
+    expected_batch = base_batch + elapsed_epochs * batch_increments_per_epoch
+    if int(state.batch) != expected_batch:
+        raise RuntimeError(
+            f"checkpoint batch counter is {state.batch}, expected {expected_batch}"
+        )
+
+
 def load_or_create_state(train_run: TrainRun, device_id) -> TrainEpochState:
     config = DeserializeConfig(
         train_run=train_run,
@@ -561,9 +607,20 @@ def load_or_create_state(train_run: TrainRun, device_id) -> TrainEpochState:
     )
     code_path = prepare_results("code", train_run)
     state = None
+    notes = train_run.notes if isinstance(train_run.notes, dict) else {}
+    require_checkpoint_resume = bool(notes.get("require_checkpoint_resume", False))
+    minimum_resume_epoch = notes.get("minimum_resume_epoch")
+    if minimum_resume_epoch is not None:
+        minimum_resume_epoch = int(minimum_resume_epoch)
+        if not require_checkpoint_resume or minimum_resume_epoch < 0:
+            raise RuntimeError("invalid strict checkpoint-resume requirements")
     try:
         state = deserialize(config)
         if state is not None:
+            if require_checkpoint_resume:
+                _validate_required_resume_state(
+                    train_run, state, minimum_resume_epoch
+                )
             if ddp.get_rank() == 0:
                 duck.insert_model_with_model_id(train_run, state.model_id)
                 checkpoint_path = get_or_create_checkpoint_path(train_run.train_config)
@@ -573,9 +630,13 @@ def load_or_create_state(train_run: TrainRun, device_id) -> TrainEpochState:
                     state._peak_parameter_norm = peak
             print(f"Resuming from epoch {state.epoch}/{train_run.epochs} (batch {state.batch})")
     except Exception as e:
+        if require_checkpoint_resume:
+            raise RuntimeError("required checkpoint resume failed") from e
         print("ERROR: Failed to load checkpoint, creating a new initial state.")
 
     if state is None:
+        if require_checkpoint_resume:
+            raise RuntimeError("required checkpoint resume returned no state")
         state = create_initial_state(
             train_run=config.train_run,
             code_path=code_path,
@@ -644,7 +705,7 @@ def do_training_unlocked(train_run: TrainRun, state: TrainEpochState, device_id)
         print(
             f"Starting periodic export to {config.staging.type} staging (interval: {config.export_interval_seconds}s)..."
         )
-        export_thread = start_periodic_export(train_run)
+        _export_thread = start_periodic_export(train_run)
         serialize(serialize_config)
 
     # Start GPU monitoring (if available)
@@ -689,6 +750,54 @@ def do_training_unlocked(train_run: TrainRun, state: TrainEpochState, device_id)
 
 def do_training(train_run: TrainRun, state: TrainEpochState, device_id):
     checkpoint_path = get_lock_path(train_run.train_config)
-    lock = FileLock(f"{checkpoint_path}", 1)
-    with lock:
+    # A caller that loaded state before another worker acquired the lock must
+    # not wait and then train that stale state after the first worker exits.
+    lock = FileLock(f"{checkpoint_path}", timeout=0)
+    if not train_run.compute_config.distributed:
+        with lock:
+            latest_epoch = get_serialized_epoch(train_run.train_config)
+            if latest_epoch is not None and latest_epoch > state.epoch:
+                raise Timeout(f"stale training state for {checkpoint_path}")
+            if state.epoch >= train_run.epochs:
+                log_run_done(train_run, state.epoch, state.epoch)
+                return
+            do_training_unlocked(train_run, state, device_id)
+        return
+
+    if not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "Distributed training requested before initializing a process group; "
+            "launch through run.py --mode torchrun."
+        )
+
+    training_complete = [state.epoch >= train_run.epochs]
+    torch.distributed.broadcast_object_list(training_complete, src=0)
+    if training_complete[0]:
+        if ddp.get_rank() == 0:
+            log_run_done(train_run, state.epoch, state.epoch)
+        return
+
+    lock_status = [False]
+    if ddp.get_rank() == 0:
+        try:
+            lock.acquire()
+            latest_epoch = get_serialized_epoch(train_run.train_config)
+            if latest_epoch is not None and latest_epoch > state.epoch:
+                lock.release()
+            else:
+                lock_status[0] = True
+        except Timeout:
+            pass
+    torch.distributed.broadcast_object_list(lock_status, src=0)
+
+    if not lock_status[0]:
+        raise Timeout(str(checkpoint_path))
+
+    try:
         do_training_unlocked(train_run, state, device_id)
+        # Nonzero ranks return before rank zero's final export. Keep the
+        # checkpoint lock until the entire distributed run has completed.
+        torch.distributed.barrier()
+    finally:
+        if ddp.get_rank() == 0:
+            lock.release()

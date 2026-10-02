@@ -2,16 +2,16 @@ from dataclasses import dataclass
 import dill
 from filelock import FileLock, Timeout
 import os
-from pathlib import Path
 from typing import List
 import random
 
+from lib.compute_env import env
 from lib.train_dataclasses import TrainRun
 from lib.serialization import is_serialized
 from lib.stable_hash import stable_hash_str as stable_hash
 
 
-DISTRIBUTED_TRAINING_REQUEST_PATH = Path("distributed_training_requests/")
+DISTRIBUTED_TRAINING_REQUEST_PATH = env().paths.distributed_requests
 
 
 def get_distributed_training_request_path(train_run):

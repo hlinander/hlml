@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import filelock
 import time
 from typing import Callable, List, Union
@@ -13,7 +15,11 @@ from lib.train import log_run_start, log_run_done
 from lib.stable_hash import stable_hash_small
 from lib.paths import get_checkpoint_path, get_lock_path
 
-from lib.train_distributed import fetch_requested_train_run, report_done, request_train_run
+from lib.train_distributed import (
+    fetch_requested_train_run,
+    report_done,
+    request_train_run,
+)
 from lib.serialization import (
     get_serialization_epoch,
     DeserializeConfig,
@@ -30,11 +36,16 @@ def do_train_run(distributed_train_run, device_id):
             env["TOKENIZERS_PARALLELISM"] = "false"
             env["EP_TORCHRUN"] = "1"
             env["EP_UNLOCKED"] = "1"
+            # The outer run.py --mode cuda process sets TORCH_DEVICE. Inner
+            # torchrun workers must initialize DDP and select LOCAL_RANK.
+            env.pop("TORCH_DEVICE", None)
             env["EP_NUM_GPUS"] = (
                 f"{distributed_train_run.train_run.compute_config.num_gpus}"
             )
             command = [
-                "torchrun",
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
                 "--nnodes",
                 "1",
                 "--nproc_per_node",
@@ -48,7 +59,9 @@ def do_train_run(distributed_train_run, device_id):
                 distributed_train_run.hash,
             ]
             process = Popen(command, env=env)
-            process.wait()
+            returncode = process.wait()
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, command)
             print("Subprocess done.")
     else:
         state = load_or_create_state(distributed_train_run.train_run, device_id)

@@ -34,7 +34,7 @@ def make_dataloader(ds, train_run: TrainRun, device_id, shuffle: bool, seed: int
         shuffle=shuffle_eff,
         num_workers=compute.num_workers,
         collate_fn=ds.collate_fn if hasattr(ds, "collate_fn") else None,
-        pin_memory=True,
+        pin_memory=torch.device(device_id).type == "cuda",
         persistent_workers=True and compute.num_workers > 0,
     )
 
