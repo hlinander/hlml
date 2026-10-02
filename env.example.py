@@ -112,10 +112,12 @@ def get_analytics_config() -> AnalyticsConfig:
     # Authenticate once with
     # `feed login https://eqp.hampe.nu/ingest`; credentials in a shared home
     # directory are available to jobs launched from the same environment. The
-    # sole project is automatic; use `feed use org/project` when several exist.
+    # sole feed is automatic; use `feed use project/feed` when several exist.
     # return AnalyticsConfig(
     #     staging=FeedTarget(
     #         server_url="https://eqp.hampe.nu/ingest",
+    #         # feed="project/feed",  # Override the saved default if needed.
+    #         # spool_dir="/private/durable/feed-spool",  # Separate from older clients.
     #     ),
     #     central=CentralDuckDB(),  # Unused by training clients in Feed mode.
     #     export_interval_seconds=2,

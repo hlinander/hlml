@@ -56,13 +56,12 @@ Feed can replace legacy Parquet staging while keeping the local DuckDB and
 checkpoint analytics used for resume and terminal visualization:
 
 ```bash
-uv sync --extra feed
-uv run --extra feed feed login https://eqp.hampe.nu/ingest
+uv sync
+uv run feed login https://eqp.hampe.nu/ingest
 ```
 
-Login automatically selects the project when only one is available. If your
-account can log to several projects, select the default once with
-`uv run --extra feed feed use organization/project`.
+Login automatically selects the feed when only one is available. Otherwise,
+select the default once with `uv run feed use project/feed`.
 
 Enable Feed in `env.py`:
 
@@ -79,16 +78,29 @@ def get_analytics_config():
     )
 ```
 
-Pass `project="organization/project"` to `FeedTarget` only when this HLML
-environment should override the Feed account's saved default.
+Pass `feed="project/feed"` to `FeedTarget` to override the saved default.
+The existing `project=` argument remains a compatibility alias. Set `spool_dir`
+to a durable private directory with working file locks, atomic replacement and
+fsync. Use a separate spool when upgrading clients: newer Feed spool formats
+may not be readable by an older client. Node-local temporary spools do not
+survive removal of that node's temporary storage.
 
 The recurring exporter sends timestamp-safe chunks, waits for acknowledged
 Feed delivery, and only then advances its independent local cursors. Run
 configuration appears in `runs`; dynamic parameters in `model_parameters`;
-scalar curves in `metrics`; richer data in `epoch_metrics`,
+scalar curves in `metric`; richer data in `epoch_metrics`,
 `evaluation_samples`, `train_steps`, and `checkpoints`.
 Heterogeneous values retain their native scalar types in columns such as
 `value_int`, `value_float`, and `value_text`, selected by `value_type`.
+
+The pinned client receives run metadata as an explicit `runs` event, including
+the nested configuration and identifiers needed to join metrics. Local
+checkpoint persistence is not a remote acknowledgement. Failed or incomplete
+delivery leaves the Feed cursor unchanged and retains the local source rows.
+Recovery is at least once, not exactly once: replay without a saved Feed cursor
+can duplicate records. Inspect retained spools with `feed status` and reconcile
+before `feed sync` or a backfill; this integration does not automatically migrate
+old spools or delete source metrics.
 
 ### SLURM
 
@@ -119,6 +131,12 @@ def run(config):
 ```
 
 SLURM parameters (time, GPUs, partition, etc.) are configured via `get_slurm_config()` in `env.py`. Sweep files can override this by defining their own `get_slurm_config()`.
+
+Install the required dependencies with `uv sync` before submitting jobs. Workers
+use `uv run --no-sync` so concurrent jobs do not modify their shared environment.
+Single jobs accept `--gpus`, `--time`, `--constraint`, `--cpus-per-task` and
+`--direct-torchrun`. Sweeps accept `--dependency JOBID`, `--array-start` and
+`--array-end`; `--deferred-num-configs` requires a success dependency.
 
 ### Local Ingestion
 

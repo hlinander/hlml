@@ -72,8 +72,8 @@ class FeedExporter:
 
     @property
     def reference(self) -> str:
-        project = self.target.project or getattr(self.run, "project", "")
-        return f"feed://{project}/{self.run.id}"
+        destination = self.target.destination or getattr(self.run, "feed", "")
+        return f"feed://{destination}/{self.run.id}"
 
     def export_pending(self, *, finish: bool = False, cursor=None) -> int:
         """Publish new rows and acknowledge them before advancing sync cursors."""
@@ -122,7 +122,7 @@ class FeedExporter:
             )
         if not report.successful:
             self._failure = _report_error(
-                "Feed permanently dropped an export batch", report
+                "Feed could not deliver an export batch; source rows retained", report
             )
             raise FeedExportError(self._failure)
 
@@ -148,7 +148,7 @@ class FeedExporter:
             )
         if not report.successful:
             self._failure = _report_error(
-                "Feed permanently dropped run metadata", report
+                "Feed could not deliver run metadata", report
             )
             raise FeedExportError(self._failure)
 
@@ -169,11 +169,12 @@ class FeedExporter:
                     self._emit_row(spec.name, row)
                     self._pending.row_count += 1
             except Exception as error:
-                if self._pending.row_count > 0:
-                    self._failure = (
-                        "Feed export stopped after a partial enqueue; the local "
-                        f"cursor was retained: {error}"
-                    )
+                # A single source row can emit several events. Even the first
+                # row may be partially admitted when a later event fails.
+                self._failure = (
+                    "Feed export stopped after a partial enqueue; the local "
+                    f"cursor was retained: {error}"
+                )
                 raise
             delivered_rows += self._settle_pending()
         return delivered_rows
@@ -418,13 +419,9 @@ class FeedExporter:
             if result is not None:
                 return float(result[0])
 
-            # Resumed analytics loaded from checkpoint have already been published by
-            # the previous execution. Start after that checkpoint watermark.
-            checkpoint_result = self.cursor.execute(
-                "SELECT last_synced_timestamp FROM sync_state WHERE table_name = ?",
-                (f"ckpt_{table_name}",),
-            ).fetchone()
-            return float(checkpoint_result[0]) if checkpoint_result is not None else 0.0
+            # Local checkpoint persistence is not a Feed acknowledgement.
+            # Without a Feed watermark, replay rather than silently skip data.
+            return 0.0
 
     def _sync_key(self, table_name: str) -> str:
         return f"feed:{table_name}"
@@ -447,8 +444,7 @@ class FeedExporter:
                 from feed import init as run_factory
             except ImportError as error:
                 raise FeedExportError(
-                    "FeedTarget requires feed-python; install the EQP "
-                    "feed optional dependency"
+                    "FeedTarget requires the pinned feed-python dependency; run uv sync"
                 ) from error
 
         serialized = self.train_run.serialize_human()
@@ -467,15 +463,20 @@ class FeedExporter:
             "slurm_jobid": serialized["slurm_jobid"],
         }
         try:
-            return run_factory(
-                project=self.target.project,
+            from lib.feed_session import init
+
+            return init(
+                feed=self.target.destination,
                 server_url=self.target.server_url,
+                spool_dir=self.target.spool_dir,
                 name=f"{self.train_run.project}-{self.model_id}",
-                config=config,
-                tags=["eqp"],
                 group=self.train_run.project,
-                max_retries=0,
-                max_retry_queue_depth=0,
+                tags=["eqp"],
+                config=config,
+                metadata={"eqp_run_id": self.train_run.run_id, "model_id": self.model_id},
+                enqueue_timeout_seconds=self.target.enqueue_timeout_seconds,
+                flush_timeout_seconds=self.target.flush_timeout_seconds,
+                run_factory=run_factory,
             )
         except Exception as error:
             message = f"FATAL: Feed analytics initialization failed: {error}"
@@ -548,10 +549,18 @@ def export_periodic_feed(
         # writes. Duplicate connections can stall on EQP's attached in-memory
         # `local` database.
         cursor = duck.CONN
-        exporter = get_feed_exporter(train_run, target, cursor)
+        exporter = None
 
-        while not exporter.closed:
+        while exporter is None or not exporter.closed:
             try:
+                with duck.CONN_LOCK:
+                    _flush_checkpoint_analytics(train_run, cursor)
+            except Exception as error:
+                log("export", f"Error during checkpoint export: {error}")
+
+            try:
+                if exporter is None:
+                    exporter = get_feed_exporter(train_run, target, cursor)
                 count = exporter.export_pending(cursor=cursor)
                 if count:
                     log_next_in(
@@ -561,12 +570,6 @@ def export_periodic_feed(
                     )
             except Exception as error:
                 log("export", f"Feed export pending: {error}")
-
-            try:
-                with duck.CONN_LOCK:
-                    _flush_checkpoint_analytics(train_run, cursor)
-            except Exception as error:
-                log("export", f"Error during checkpoint export: {error}")
 
             time.sleep(interval_seconds)
 
@@ -599,7 +602,12 @@ def _timestamp(value) -> float:
 
 
 def _report_error(prefix: str, report) -> str:
-    return (
+    message = (
         f"{prefix}: delivered={report.delivered}, filtered={report.filtered}, "
-        f"dropped={report.dropped}, pending={report.pending}"
+        f"failed={report.failed}, pending={report.pending}, "
+        f"persisted_pending={report.persisted_pending}, unsaved={report.unsaved}, "
+        f"spool_path={report.spool_path}"
     )
+    if report.storage_error:
+        message += f", storage_error={report.storage_error}"
+    return message

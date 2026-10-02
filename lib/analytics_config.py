@@ -79,6 +79,16 @@ class FeedTarget:
     chunk_size: int = 1000
     enqueue_timeout_seconds: float = 30.0
     flush_timeout_seconds: float = 30.0
+    spool_dir: Optional[str] = None
+    feed: Optional[str] = None
+
+    def __post_init__(self):
+        if self.feed and self.project and self.feed != self.project:
+            raise ValueError("FeedTarget.feed and legacy project must identify the same feed")
+
+    @property
+    def destination(self) -> Optional[str]:
+        return self.feed or self.project
 
 
 @dataclass

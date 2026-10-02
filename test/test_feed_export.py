@@ -19,20 +19,37 @@ class _Report:
     dropped: int = 0
     pending: int = 0
     complete: bool = True
+    persisted_pending: int = 0
+    unsaved: int = 0
+    spool_path: str = ""
+    storage_error: str = ""
 
     @property
     def successful(self):
-        return self.complete and self.dropped == 0
+        return self.complete and self.dropped == 0 and not self.storage_error
+
+    @property
+    def failed(self):
+        return self.dropped
 
 
 class _FakeRun:
     id = "fake-session"
 
-    def __init__(self, reports=None, project=None):
+    def __init__(self, reports=None, feed=None):
         self.events = []
         self.reports = list(reports or [])
         self.finished = False
-        self.project = project
+        self.feed = feed
+
+    def emit_wait(self, stream_name, fields, *, timeout):
+        self.events.append({
+            "stream_name": stream_name,
+            "data": {field.name: field.data_value() for field in fields},
+            "schema": {field.name: field.type_descriptor() for field in fields},
+            "timeout": timeout,
+        })
+        return True
 
     def log_wait(self, stream_name, record, *, timeout):
         self.events.append(
@@ -84,8 +101,11 @@ def test_default_feed_project_is_delegated_to_feed_init(local_duck):
     captured = {}
 
     def init_feed(**kwargs):
+        import feed
+        import inspect
+        inspect.signature(feed.init).bind(**kwargs)
         captured.update(kwargs)
-        return _FakeRun(project="lab/paper")
+        return _FakeRun(feed="lab/paper")
 
     exporter = FeedExporter(
         train_run,
@@ -94,8 +114,15 @@ def test_default_feed_project_is_delegated_to_feed_init(local_duck):
         run_factory=init_feed,
     )
 
-    assert captured["project"] is None
+    assert captured["feed"] is None
     assert exporter.reference == "feed://lab/paper/fake-session"
+    event = exporter.run.events[0]
+    assert event['stream_name'] == 'runs'
+    assert event['schema']['config'] == 'variant'
+    assert event['data']['config']['eqp']['run_id'] == train_run.run_id
+    assert event['data']['eqp_run_id'] == train_run.run_id
+    assert event['data']['model_id'] == exporter.model_id
+    assert event['data']['config']['train_config']['scheduler_config'] is None
 
 
 def test_feed_init_failure_is_logged_loudly(local_duck, monkeypatch):
@@ -312,3 +339,102 @@ def test_cursor_uses_duckdb_epoch_without_timestamp_rounding(local_duck):
     rows, _, boundary = exporter._next_chunk(spec, float("inf"))
     assert rows == []
     assert boundary is None
+
+
+def test_feed_destination_alias_and_spool(local_duck, tmp_path):
+    train_run, _ = _local_run()
+    captured = {}
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return _FakeRun(feed=kwargs['feed'])
+
+    exporter = FeedExporter(train_run, FeedTarget(feed='lab/weather', spool_dir=str(tmp_path)),
+                            duck.CONN, run_factory=factory)
+    assert captured == dict(feed='lab/weather', server_url=None, spool_dir=str(tmp_path))
+    assert exporter.reference == 'feed://lab/weather/fake-session'
+    assert FeedTarget(project='lab/weather').destination == 'lab/weather'
+    with pytest.raises(ValueError, match='same feed'):
+        FeedTarget(feed='lab/weather', project='lab/other')
+
+
+def test_checkpoint_watermark_is_not_delivery_acknowledgement(local_duck):
+    train_run, model_id = _local_run()
+    duck.insert_train_step_metric(model_id, train_run.run_id, 'loss', 1, 0.5)
+    duck.CONN.execute("INSERT INTO sync_state VALUES ('ckpt_train_step_metric', 9999999999)")
+    run = _FakeRun()
+    exporter = FeedExporter(train_run, FeedTarget(), duck.CONN, run=run)
+    assert exporter.export_pending() == 1
+    assert len(run.events) == 1
+    assert duck.CONN.execute('SELECT count(*) FROM train_step_metric').fetchone()[0] == 1
+
+
+def test_first_source_row_partial_enqueue_never_advances_cursor(local_duck):
+    train_run, model_id = _local_run()
+    duck.insert_train_epoch_metric(model_id, train_run.run_id, 1, 1, 'loss',
+                                   'TestDataset', 'train', .5, .4, .6, 10)
+
+    class PartialRun(_FakeRun):
+        def log_wait(self, stream_name, record, *, timeout):
+            if stream_name == 'epoch_metrics':
+                return False
+            return super().log_wait(stream_name, record, timeout=timeout)
+
+    run = PartialRun()
+    exporter = FeedExporter(train_run, FeedTarget(), duck.CONN, run=run)
+    with pytest.raises(FeedExportError, match='did not accept'):
+        exporter.export_pending()
+    assert len(run.events) == 1
+    with pytest.raises(FeedExportError, match='partial enqueue'):
+        exporter.export_pending()
+    assert duck.CONN.execute("SELECT count(*) FROM sync_state WHERE table_name LIKE 'feed:%'").fetchone()[0] == 0
+    assert duck.CONN.execute('SELECT count(*) FROM train_epoch_metric').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('report', [
+    _Report(dropped=1),
+    _Report(storage_error='disk full'),
+    _Report(pending=1, persisted_pending=1, complete=False),
+    _Report(pending=1, unsaved=1, complete=False),
+])
+def test_failed_or_unacknowledged_delivery_retains_local_rows(local_duck, report):
+    train_run, model_id = _local_run()
+    duck.insert_train_step_metric(model_id, train_run.run_id, 'loss', 1, .5)
+    exporter = FeedExporter(train_run, FeedTarget(), duck.CONN, run=_FakeRun([report]))
+    with pytest.raises(FeedExportError):
+        exporter.export_pending()
+    assert duck.CONN.execute("SELECT count(*) FROM sync_state WHERE table_name LIKE 'feed:%'").fetchone()[0] == 0
+    assert duck.CONN.execute('SELECT count(*) FROM train_step_metric').fetchone()[0] == 1
+
+
+def test_recreated_exporter_uses_acknowledged_cursor_without_dropping_new_rows(local_duck):
+    train_run, model_id = _local_run()
+    duck.insert_train_step_metric(model_id, train_run.run_id, 'loss', 1, .5)
+    first = FeedExporter(train_run, FeedTarget(), duck.CONN, run=_FakeRun())
+    assert first.export_pending() == 1
+    duck.insert_train_step_metric(model_id, train_run.run_id, 'loss', 2, .25)
+    run = _FakeRun()
+    second = FeedExporter(train_run, FeedTarget(), duck.CONN, run=run)
+    assert second.export_pending() == 1
+    assert [event['data']['step'] for event in run.events] == [2]
+    assert duck.CONN.execute('SELECT count(*) FROM train_step_metric').fetchone()[0] == 2
+
+
+def test_final_export_saves_checkpoint_analytics_before_feed_failure(local_duck, monkeypatch):
+    from lib.analytics_config import AnalyticsConfig
+    from lib.export import export_all
+    train_run, model_id = _local_run()
+    duck.insert_train_step_metric(model_id, train_run.run_id, 'loss', 1, .5)
+    calls = []
+    monkeypatch.setattr('lib.export_feed._flush_checkpoint_analytics',
+                        lambda *_args: calls.append('persist'))
+
+    def fail(*args, **kwargs):
+        calls.append('feed')
+        raise FeedExportError('offline')
+
+    monkeypatch.setattr('lib.export_feed.finish_feed_export', fail)
+    with pytest.raises(FeedExportError, match='offline'):
+        export_all(train_run, AnalyticsConfig(staging=FeedTarget()))
+    assert calls == ['persist', 'feed']
+    assert duck.CONN.execute('SELECT count(*) FROM train_step_metric').fetchone()[0] == 1

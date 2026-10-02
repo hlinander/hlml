@@ -1007,6 +1007,7 @@ dependencies = [
     { name = "dill" },
     { name = "duckdb" },
     { name = "einops" },
+    { name = "feed-python" },
     { name = "filelock" },
     { name = "gitpython" },
     { name = "h5netcdf" },
@@ -1047,9 +1048,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-feed = [
-    { name = "feed-python" },
-]
 graphcast = [
     { name = "torch-scatter" },
 ]
@@ -1068,7 +1066,7 @@ requires-dist = [
     { name = "dill", specifier = ">=0.3.9" },
     { name = "duckdb", specifier = "==1.5.2" },
     { name = "einops", specifier = ">=0.8.1" },
-    { name = "feed-python", marker = "extra == 'feed'", git = "https://github.com/linstromcloud/feed-python.git" },
+    { name = "feed-python", git = "https://github.com/linstromcloud/feed-python.git?rev=a809278ab1ea298598a282db49ba605d18552f1d" },
     { name = "filelock", specifier = ">=3.17.0" },
     { name = "gitpython", specifier = ">=3.1.44" },
     { name = "h5netcdf", specifier = ">=1.8.1" },
@@ -1148,7 +1146,7 @@ wheels = [
 [[package]]
 name = "feed-python"
 version = "0.1.0"
-source = { git = "https://github.com/linstromcloud/feed-python.git#42fb2bc3c31f5b3d29ee342ab2f80e37d6cdb40d" }
+source = { git = "https://github.com/linstromcloud/feed-python.git?rev=a809278ab1ea298598a282db49ba605d18552f1d#a809278ab1ea298598a282db49ba605d18552f1d" }
 dependencies = [
     { name = "requests" },
 ]

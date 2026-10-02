@@ -256,6 +256,7 @@ def export_periodic(
     """
     import threading
     import time
+    from lib.export import EXPORT_LOCK
 
     # Load config to get bucket and prefix
     from lib.analytics_config import analytics_config
@@ -281,22 +282,37 @@ def export_periodic(
         from lib.log import log_next_in
 
         while True:
-            try:
-                paths = flush_all_to_s3(train_run, s3_bucket, cursor, s3_prefix)
-                if paths:
-                    log_next_in("export", f"Exported {len(paths)} files to S3", interval_seconds)
-            except Exception as e:
-                import traceback
-                log("export", f"Error during export: {e}\n{traceback.format_exc()}")
+            with EXPORT_LOCK:
+                try:
+                    paths = flush_all_to_s3(
+                        train_run, s3_bucket, cursor, s3_prefix
+                    )
+                    if paths:
+                        log_next_in(
+                            "export",
+                            f"Exported {len(paths)} files to S3",
+                            interval_seconds,
+                        )
+                except Exception as e:
+                    import traceback
 
-            try:
-                from lib.staging_filesystem import flush_all_to_checkpoint
-                from lib.paths import get_or_create_checkpoint_path
-                checkpoint_path = get_or_create_checkpoint_path(train_run.train_config)
-                flush_all_to_checkpoint(train_run, checkpoint_path, cursor)
-            except Exception as e:
-                import traceback
-                log("export", f"Error during checkpoint export: {e}\n{traceback.format_exc()}")
+                    log("export", f"Error during export: {e}\n{traceback.format_exc()}")
+
+                try:
+                    from lib.staging_filesystem import flush_all_to_checkpoint
+                    from lib.paths import get_or_create_checkpoint_path
+
+                    checkpoint_path = get_or_create_checkpoint_path(
+                        train_run.train_config
+                    )
+                    flush_all_to_checkpoint(train_run, checkpoint_path, cursor)
+                except Exception as e:
+                    import traceback
+
+                    log(
+                        "export",
+                        f"Error during checkpoint export: {e}\n{traceback.format_exc()}",
+                    )
 
             time.sleep(interval_seconds)
 
