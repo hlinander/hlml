@@ -63,7 +63,7 @@ test = [
 feed = []  # Compatibility with existing uv --extra feed commands.
 
 [tool.uv.sources]
-feed-python = { git = "https://github.com/linstromcloud/feed-python.git", rev = "a809278ab1ea298598a282db49ba605d18552f1d" }
+feed-python = { git = "ssh://git@github.com/linstromcloud-clients/feed-client.git", subdirectory = "python", rev = "ec2e78068b85eeed469671b418ba64d904196dba" }
 
 [[tool.uv.index]]
 name = "pyg-wheels"
