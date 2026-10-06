@@ -1066,7 +1066,7 @@ requires-dist = [
     { name = "dill", specifier = ">=0.3.9" },
     { name = "duckdb", specifier = "==1.5.2" },
     { name = "einops", specifier = ">=0.8.1" },
-    { name = "feed-python", git = "ssh://git@github.com/linstromcloud-clients/feed-client.git?subdirectory=python&rev=ec2e78068b85eeed469671b418ba64d904196dba" },
+    { name = "feed-python", git = "ssh://git@github.com/linstromcloud-clients/feed-client.git?subdirectory=python" },
     { name = "filelock", specifier = ">=3.17.0" },
     { name = "gitpython", specifier = ">=3.1.44" },
     { name = "h5netcdf", specifier = ">=1.8.1" },
@@ -1146,9 +1146,10 @@ wheels = [
 [[package]]
 name = "feed-python"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/linstromcloud-clients/feed-client.git?subdirectory=python&rev=ec2e78068b85eeed469671b418ba64d904196dba#ec2e78068b85eeed469671b418ba64d904196dba" }
+source = { git = "ssh://git@github.com/linstromcloud-clients/feed-client.git?subdirectory=python#91fa8aa9e265850e1b2ea3f00717d1573b27365d" }
 dependencies = [
     { name = "requests" },
+    { name = "wcwidth" },
 ]
 
 [[package]]
